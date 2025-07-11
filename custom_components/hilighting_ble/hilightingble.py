@@ -4,10 +4,7 @@ from typing import Any, TypeVar, cast, Tuple
 from collections.abc import Callable
 
 from homeassistant.components import bluetooth
-from homeassistant.components.bluetooth import (
-    BluetoothServiceInfoBleak,
-    async_ble_device_from_address,
-)
+from homeassistant.components.bluetooth import async_ble_device_from_address
 from homeassistant.components.light import ColorMode, EFFECT_OFF
 from homeassistant.exceptions import ConfigEntryNotReady
 
@@ -64,15 +61,14 @@ class HILIGHTINGInstance:
     def __init__(
         self,
         hass,
-        service_info: BluetoothServiceInfoBleak,
+        mac: str,
         delay: int = 30,
         data: dict = {},
         options: dict = {},
     ):
         self._hass = hass
-        self._service_info = service_info
-        self._mac = service_info.address
-        self._name = service_info.name or f"HILIGHTING-{self._mac[-5:]}"
+        self._mac = mac
+        self._name = f"HILIGHTING-{self._mac[-5:].replace(':', '')}"
         self._delay = delay
         self._data = data
         self._options = options
