@@ -1,202 +1,118 @@
 import asyncio
+import logging
+from typing import Any, TypeVar, cast, Tuple
+from collections.abc import Callable
+
 from homeassistant.components import bluetooth
+from homeassistant.components.bluetooth import (
+    BluetoothServiceInfoBleak,
+    async_ble_device_from_address,
+)
+from homeassistant.components.light import ColorMode, EFFECT_OFF
 from homeassistant.exceptions import ConfigEntryNotReady
-from homeassistant.components.light import (ColorMode)
-from homeassistant.components.light import EFFECT_OFF
+
 from bleak.backends.device import BLEDevice
 from bleak.backends.service import BleakGATTCharacteristic, BleakGATTServiceCollection
 from bleak.exc import BleakDBusError
-from bleak_retry_connector import BLEAK_RETRY_EXCEPTIONS as BLEAK_EXCEPTIONS
 from bleak_retry_connector import (
+    BLEAK_RETRY_EXCEPTIONS as BLEAK_EXCEPTIONS,
     BleakClientWithServiceCache,
-    #BleakError,
     BleakNotFoundError,
-    #ble_device_has_changed,
     establish_connection,
 )
-from typing import Any, TypeVar, cast, Tuple
-from collections.abc import Callable
-import logging
-#import colorsys
-
 
 LOGGER = logging.getLogger(__name__)
 
-EFFECT_MAP = {}
-for e in range(10):
-    EFFECT_MAP[f"Effect {e}"] = e
+EFFECT_MAP = {f"Effect {i}": i for i in range(10)}
 EFFECT_LIST = sorted(EFFECT_MAP)
 EFFECT_ID_TO_NAME = {v: k for k, v in EFFECT_MAP.items()}
 
-NAME_ARRAY = ["L7161", "L7183"]
 WRITE_CHARACTERISTIC_UUID = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"
-FIRMWARE_REVISION_UUID    = "00002a26-0000-1000-8000-00805f9b34fb"
-SW_NUMBER_UUID            = "00002a28-0000-1000-8000-00805f9b34fb"
-MANUFACTURER_NAME_UUID    = "00002a29-0000-1000-8000-00805f9b34fb"
-TURN_ON_CMD               = [bytearray.fromhex("55 01 02 01")]
-TURN_OFF_CMD              = [bytearray.fromhex("55 01 02 00")]
+FIRMWARE_REVISION_UUID = "00002a26-0000-1000-8000-00805f9b34fb"
+SW_NUMBER_UUID = "00002a28-0000-1000-8000-00805f9b34fb"
+MANUFACTURER_NAME_UUID = "00002a29-0000-1000-8000-00805f9b34fb"
 DEFAULT_ATTEMPTS = 3
 BLEAK_BACKOFF_TIME = 0.25
-RETRY_BACKOFF_EXCEPTIONS = (BleakDBusError)
+RETRY_BACKOFF_EXCEPTIONS = (BleakDBusError,)
 
 WrapFuncType = TypeVar("WrapFuncType", bound=Callable[..., Any])
 
 def retry_bluetooth_connection_error(func: WrapFuncType) -> WrapFuncType:
-    async def _async_wrap_retry_bluetooth_connection_error(
-        self: "HILIGHTINGInstance", *args: Any, **kwargs: Any
-    ) -> Any:
-        attempts = DEFAULT_ATTEMPTS
-        max_attempts = attempts - 1
-
-        for attempt in range(attempts):
+    async def _async_wrap(self: "HILIGHTINGInstance", *args: Any, **kwargs: Any) -> Any:
+        for attempt in range(DEFAULT_ATTEMPTS):
             try:
                 return await func(self, *args, **kwargs)
             except BleakNotFoundError:
-                # The lock cannot be found so there is no
-                # point in retrying.
                 raise
             except RETRY_BACKOFF_EXCEPTIONS as err:
-                if attempt >= max_attempts:
-                    LOGGER.debug(
-                        "%s: %s error calling %s, reach max attempts (%s/%s)",
-                        self.name,
-                        type(err),
-                        func,
-                        attempt,
-                        max_attempts,
-                        exc_info=True,
-                    )
+                if attempt == DEFAULT_ATTEMPTS - 1:
+                    LOGGER.error("%s: Max retries reached on %s: %s", self.name, func.__name__, err)
                     raise
-                LOGGER.debug(
-                    "%s: %s error calling %s, backing off %ss, retrying (%s/%s)...",
-                    self.name,
-                    type(err),
-                    func,
-                    BLEAK_BACKOFF_TIME,
-                    attempt,
-                    max_attempts,
-                    exc_info=True,
-                )
+                LOGGER.warning("%s: Retry %s/%s on %s due to %s", self.name, attempt+1, DEFAULT_ATTEMPTS, func.__name__, err)
                 await asyncio.sleep(BLEAK_BACKOFF_TIME)
             except BLEAK_EXCEPTIONS as err:
-                if attempt >= max_attempts:
-                    LOGGER.debug(
-                        "%s: %s error calling %s, reach max attempts (%s/%s): %s",
-                        self.name,
-                        type(err),
-                        func,
-                        attempt,
-                        max_attempts,
-                        err,
-                        exc_info=True,
-                    )
+                if attempt == DEFAULT_ATTEMPTS - 1:
+                    LOGGER.error("%s: Max retries reached on %s: %s", self.name, func.__name__, err)
                     raise
-                LOGGER.debug(
-                    "%s: %s error calling %s, retrying  (%s/%s)...: %s",
-                    self.name,
-                    type(err),
-                    func,
-                    attempt,
-                    max_attempts,
-                    err,
-                    exc_info=True,
-                )
+                LOGGER.warning("%s: BLE error retry %s/%s on %s: %s", self.name, attempt+1, DEFAULT_ATTEMPTS, func.__name__, err)
+                await asyncio.sleep(BLEAK_BACKOFF_TIME)
 
-    return cast(WrapFuncType, _async_wrap_retry_bluetooth_connection_error)
+    return cast(WrapFuncType, _async_wrap)
 
 
 class HILIGHTINGInstance:
-    def __init__(self, address, delay: int, hass, data={}, options={}) -> None:
-        self.loop = asyncio.get_running_loop()
-        self._mac = address
-        self._delay = delay
+    def __init__(
+        self,
+        hass,
+        service_info: BluetoothServiceInfoBleak,
+        delay: int = 30,
+        data: dict = {},
+        options: dict = {},
+    ):
         self._hass = hass
-        #self._data = data
+        self._service_info = service_info
+        self._mac = service_info.address
+        self._name = service_info.name or f"HILIGHTING-{self._mac[-5:]}"
+        self._delay = delay
+        self._data = data
         self._options = options
-        
-        self._device: BLEDevice | None = None
-        self._device = bluetooth.async_ble_device_from_address(self._hass, address)
+
+        self._device: BLEDevice | None = async_ble_device_from_address(hass, self._mac, connectable=True)
         if not self._device:
-            raise ConfigEntryNotReady(
-                f"You need to add bluetooth integration (https://www.home-assistant.io/integrations/bluetooth) or couldn't find a nearby device with address: {address}"
-            )
-        self._connect_lock: asyncio.Lock = asyncio.Lock()
+            raise ConfigEntryNotReady(f"Device with address {self._mac} not found via Home Assistant Bluetooth integration.")
+
+        self.loop = asyncio.get_running_loop()
+        self._connect_lock = asyncio.Lock()
         self._client: BleakClientWithServiceCache | None = None
-        self._disconnect_timer: asyncio.TimerHandle | None = None
         self._cached_services: BleakGATTServiceCollection | None = None
         self._expected_disconnect = False
-        self._is_on = None
-        self._rgb_color = None
+        self._disconnect_timer: asyncio.TimerHandle | None = None
+
+        self._is_on = False
+        self._rgb_color = (255, 255, 255)
         self._brightness = 255
-        self._effect = None
-        self._effect_speed = 0x64
+        self._effect = EFFECT_OFF
         self._color_mode = ColorMode.RGB
+
         self._write_uuid = None
         self._manufacturer_name_char = None
         self._firmware_revision_char = None
-        self._model_number_char      = None
-        self._turn_on_cmd  = bytearray.fromhex("55 01 02 01")
+        self._model_number_char = None
+
+        self._turn_on_cmd = bytearray.fromhex("55 01 02 01")
         self._turn_off_cmd = bytearray.fromhex("55 01 02 00")
-        self._model             = data.get("model", None)
-        self._manufacturer_name = data.get("manufacturer_name", None)
-        self._firmware_version  = data.get("firmware_version", None)
 
-        LOGGER.debug(
-            f"Model information for device {self._device.name} : ModelNo {self._model}. MAC: {self._mac}. Data: {data}. Options: {self._options}"
-        )
-        LOGGER.debug(f"Manufacturer name: {self._manufacturer_name}")
-        LOGGER.debug(f"Firmware version: {self._firmware_version}")
-        LOGGER.debug(f"Model number: {self._model}")
-
-    async def _retrieve_device_info(self):
-        if self._model is None:
-            LOGGER.debug("Looking up model number")
-            m = await self._read_characteristic(self._model_number_char)
-            LOGGER.debug(f"Model number: {m}")
-            if m: self._model = m.decode('ascii')
-        if self._manufacturer_name is None:
-            LOGGER.debug("Looking up manu name")
-            m = await self._read_characteristic(self._manufacturer_name_char)
-            LOGGER.debug(f"Manufacturer name: {m}")
-            if m: self._manufacturer_name = m.decode('ascii')
-        if self._firmware_version is None:
-            LOGGER.debug("Looking up fw number")
-            m = await self._read_characteristic(self._firmware_revision_char)
-            LOGGER.debug(f"Firmware version: {m}")
-            if m: self._firmware_version = m.decode('ascii')
-        
-        return bool(self._model and self._manufacturer_name and self._firmware_version)
-
-    async def _read_characteristic(self, char: BleakGATTCharacteristic):
-        if not char:
-            LOGGER.error(f"No characteristic to read")
-            return None
-        if self._client is not None:
-            data = await self._client.read_gatt_char(char.uuid)
-            LOGGER.debug(f"Char read data: {data}")
-            return data
-        return None
-    
-    async def _write(self, data: bytearray):
-        """Send command to device and read response."""
-        await self._ensure_connected()
-        await self._write_while_connected(data)
-
-    async def _write_while_connected(self, data: bytearray):
-        LOGGER.debug(f"Writing data to {self.name}: {data.hex()}")
-        await self._client.write_gatt_char(self._write_uuid, data, False)
-    
-    @property
-    def mac(self):
-        return self._device.address
+        self._model = data.get("model")
+        self._manufacturer_name = data.get("manufacturer_name")
+        self._firmware_version = data.get("firmware_version")
 
     @property
     def name(self):
-        return self._device.name
+        return self._name
 
     @property
-    def rssi(self):
-        return self._device.rssi
+    def mac(self):
+        return self._mac
 
     @property
     def is_on(self):
@@ -204,20 +120,20 @@ class HILIGHTINGInstance:
 
     @property
     def brightness(self):
-        return self._brightness 
+        return self._brightness
 
     @property
     def rgb_color(self):
         return self._rgb_color
 
     @property
-    def effect_list(self) -> list[str]:
+    def effect_list(self):
         return EFFECT_LIST
 
     @property
     def effect(self):
         return self._effect
-    
+
     @property
     def color_mode(self):
         return self._color_mode
@@ -226,7 +142,7 @@ class HILIGHTINGInstance:
     async def turn_on(self):
         await self._write(self._turn_on_cmd)
         self._is_on = True
-                
+
     @retry_bluetooth_connection_error
     async def turn_off(self):
         await self._write(self._turn_off_cmd)
@@ -234,171 +150,96 @@ class HILIGHTINGInstance:
 
     @retry_bluetooth_connection_error
     async def set_rgb_color(self, rgb: Tuple[int, int, int]):
-        """
-            |------|------------------------ header
-            |      | ||--------------------- red
-            |      | || ||------------------ green
-            |      | || || ||--------------- blue
-            55 07 01 ff 00 00
-            55 07 01 00 ff 00
-            55 07 01 00 00 ff
-        """
         self._rgb_color = rgb
-        red = int(rgb[0])
-        green = int(rgb[1])
-        blue = int(rgb[2])
-        rgb_packet = bytearray.fromhex("55 07 01 00 00 00")
-        rgb_packet[3] = red
-        rgb_packet[4] = green
-        rgb_packet[5] = blue
-        await self._write(rgb_packet)
+        packet = bytearray([0x55, 0x07, 0x01, rgb[0], rgb[1], rgb[2]])
+        await self._write(packet)
         self._effect = EFFECT_OFF
-    
+
     @retry_bluetooth_connection_error
     async def set_brightness(self, brightness: int):
         self._brightness = brightness
-        brightness_packet = bytearray.fromhex("55 03 01 ff 03")
-        b = int(brightness * 0.06)
-        if b > 0x0f:
-            b = 0x0f
-        brightness_packet[4] = b
-        await self._write(brightness_packet)
-    
+        b = min(int(brightness * 0.06), 0x0f)
+        packet = bytearray([0x55, 0x03, 0x01, 0xff, b])
+        await self._write(packet)
+
     @retry_bluetooth_connection_error
     async def set_effect(self, effect: str):
-        if effect not in EFFECT_LIST:
-            LOGGER.error("Effect %s not supported", effect)
+        if effect not in EFFECT_MAP:
+            LOGGER.error("Unsupported effect: %s", effect)
             return
+        effect_id = EFFECT_MAP[effect]
+        packet = bytearray([0x55, 0x04, 0x01, effect_id])
+        await self._write(packet)
         self._effect = effect
-        effect_packet = bytearray.fromhex("55 04 01 00")
-        effect_id = EFFECT_MAP.get(effect)
-        LOGGER.debug('Effect ID: %s', effect_id)
-        LOGGER.debug('Effect name: %s', effect)
-        effect_packet[3] = effect_id
-        await self._write(effect_packet)
-    
+
     @retry_bluetooth_connection_error
     async def set_effect_speed(self, speed: int):
-        speed_packet = bytearray.fromhex("55 04 04 7f")
-        speed_packet[3] = int(speed * 2.55)
-        LOGGER.debug(f"Speed packet: {speed_packet}")
-        speed_packet_str = "0x" + "".join(f"{byte:02x}" for byte in speed_packet)
-        LOGGER.debug(f"Speed packet: {speed_packet_str}")
-        await self._write(speed_packet)
+        speed_byte = min(max(int(speed * 2.55), 0), 255)
+        packet = bytearray([0x55, 0x04, 0x04, speed_byte])
+        await self._write(packet)
 
-    @retry_bluetooth_connection_error
-    async def update(self):
-        LOGGER.debug("%s: Update in hilighting called", self.name)
-        # if self._model is None:
-        #     self._model = await self._detect_model()
-        #     LOGGER.debug(f"Model: {self._model}")
-        
+    async def _write(self, data: bytearray):
+        await self._ensure_connected()
+        await self._client.write_gatt_char(self._write_uuid, data, False)
 
-    async def _ensure_connected(self) -> None:
-        """Ensure connection to device is established."""
-        if self._connect_lock.locked():
-            LOGGER.debug(
-                "%s: Connection already in progress, waiting for it to complete",
-                self.name,
-            )
+    async def _ensure_connected(self):
         if self._client and self._client.is_connected:
             self._reset_disconnect_timer()
             return
+
         async with self._connect_lock:
-            # Check again while holding the lock
             if self._client and self._client.is_connected:
                 self._reset_disconnect_timer()
                 return
-            LOGGER.debug("%s: Connecting", self.name)
+
+            LOGGER.debug("%s: Connecting...", self.name)
             client = await establish_connection(
                 BleakClientWithServiceCache,
                 self._device,
                 self.name,
                 self._disconnected,
-                # cached_services=self._cached_services,
                 use_cached_services=True,
                 ble_device_callback=lambda: self._device,
             )
-            LOGGER.debug("%s: Connected", self.name)
-            resolved = self._resolve_characteristics(client.services)
-            
-            LOGGER.debug(f"Resolved: {resolved}")
-            if not resolved:
-                # Try to handle services failing to load
-                #resolved = self._resolve_characteristics(await client.get_services())
-                LOGGER.debug(f"Chars were not resolved.  Trying again...")
-                resolved = self._resolve_characteristics(client.services)
-                LOGGER.debug(f"After trying to resolve: Resolved: {resolved}")
-            self._cached_services = client.services if resolved else None
+
+            if not self._resolve_characteristics(client.services):
+                LOGGER.debug("Initial resolve failed, trying with fresh services")
+                await client.get_services()
+                self._resolve_characteristics(client.services)
 
             self._client = client
-            await self._retrieve_device_info()
+            self._cached_services = client.services
             self._reset_disconnect_timer()
 
     def _resolve_characteristics(self, services: BleakGATTServiceCollection) -> bool:
-        """Resolve characteristics."""
-        LOGGER.debug(f"Resolving characteristics for {self.name}")
-        if char := services.get_characteristic(WRITE_CHARACTERISTIC_UUID):
-                self._write_uuid = char
-        if char := services.get_characteristic(MANUFACTURER_NAME_UUID):
-            self._manufacturer_name_char = char
-        if char := services.get_characteristic(FIRMWARE_REVISION_UUID):
-            self._firmware_revision_char = char
-        if char := services.get_characteristic(SW_NUMBER_UUID):
-            self._model_number_char = char
-            LOGGER.debug(f"Model number char: {char}")
-            LOGGER.debug(f"Model number char UUID: {char.uuid}")
-            LOGGER.debug(f"Type of char: {type(char)}")
-        LOGGER.debug(f"Chars: Write: {self._write_uuid} Manu name: {self._manufacturer_name_char} Firmware rev: {self._firmware_revision_char} Model num: {self._model_number_char}")
-        return bool(self._write_uuid and self._manufacturer_name_char and self._firmware_revision_char and self._model_number_char)
+        self._write_uuid = services.get_characteristic(WRITE_CHARACTERISTIC_UUID)
+        self._manufacturer_name_char = services.get_characteristic(MANUFACTURER_NAME_UUID)
+        self._firmware_revision_char = services.get_characteristic(FIRMWARE_REVISION_UUID)
+        self._model_number_char = services.get_characteristic(SW_NUMBER_UUID)
+        return all([self._write_uuid, self._manufacturer_name_char, self._firmware_revision_char, self._model_number_char])
 
-    def _reset_disconnect_timer(self) -> None:
-        """Reset disconnect timer."""
+    def _reset_disconnect_timer(self):
         if self._disconnect_timer:
             self._disconnect_timer.cancel()
         self._expected_disconnect = False
-        if self._delay is not None and self._delay != 0:
-            LOGGER.debug(
-                "%s: Configured disconnect from device in %s seconds",
-                self.name,
-                self._delay
-            )
+        if self._delay:
             self._disconnect_timer = self.loop.call_later(self._delay, self._disconnect)
 
-    def _disconnected(self, client: BleakClientWithServiceCache) -> None:
-        """Disconnected callback."""
+    def _disconnected(self, client):
         if self._expected_disconnect:
-            LOGGER.debug("%s: Disconnected from device", self.name)
-            return
-        LOGGER.warning("%s: Device unexpectedly disconnected", self.name)
+            LOGGER.debug("%s: Disconnected (expected)", self.name)
+        else:
+            LOGGER.warning("%s: Unexpected disconnect", self.name)
 
-    def _disconnect(self) -> None:
-        """Disconnect from device."""
+    def _disconnect(self):
         self._disconnect_timer = None
-        asyncio.create_task(self._execute_timed_disconnect())
+        asyncio.create_task(self._execute_disconnect())
 
-    async def stop(self) -> None:
-        """Stop the LEDBLE."""
-        LOGGER.debug("%s: Stop", self.name)
-        await self._execute_disconnect()
-
-    async def _execute_timed_disconnect(self) -> None:
-        """Execute timed disconnection."""
-        LOGGER.debug(
-            "%s: Disconnecting after timeout of %s",
-            self.name,
-            self._delay
-        )
-        await self._execute_disconnect()
-
-    async def _execute_disconnect(self) -> None:
-        """Execute disconnection."""
+    async def _execute_disconnect(self):
         async with self._connect_lock:
-            client = self._client
-            self._expected_disconnect = True
+            if self._client and self._client.is_connected:
+                self._expected_disconnect = True
+                await self._client.disconnect()
+                LOGGER.debug("%s: Disconnected", self.name)
             self._client = None
             self._write_uuid = None
-            if client and client.is_connected:
-                await client.disconnect()
-            LOGGER.debug("%s: Disconnected", self.name)
-    
