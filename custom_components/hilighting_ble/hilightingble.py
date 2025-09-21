@@ -296,41 +296,45 @@ class HILIGHTINGInstance:
 
     async def _ensure_connected(self) -> None:
         """Ensure connection to device is established."""
+        # Cancel any pending disconnects
+        if self._disconnect_timer:
+            try:
+                self._disconnect_timer.cancel()
+            except Exception:
+                pass
+            self._disconnect_timer = None
         if self._connect_lock.locked():
-            LOGGER.debug(
-                "%s: Connection already in progress, waiting for it to complete",
-                self.name,
-            )
+            LOGGER.debug("%s: Connection already in progress, waiting", self.name)
         if self._client and self._client.is_connected:
             self._reset_disconnect_timer()
             return
         async with self._connect_lock:
-            # Check again while holding the lock
+            # Double-check inside lock
             if self._client and self._client.is_connected:
                 self._reset_disconnect_timer()
                 return
+            # Force disconnect stale client
+            if self._client:
+                try:
+                    await self._client.disconnect()
+                except Exception as err:
+                    LOGGER.warning("%s: Error force-disconnecting stale client: %s", self.name, err)
+                self._client = None
             LOGGER.debug("%s: Connecting", self.name)
             client = await establish_connection(
                 BleakClientWithServiceCache,
                 self._device,
                 self.name,
                 self._disconnected,
-                # cached_services=self._cached_services,
                 use_cached_services=True,
                 ble_device_callback=lambda: self._device,
             )
             LOGGER.debug("%s: Connected", self.name)
             resolved = self._resolve_characteristics(client.services)
-            
-            LOGGER.debug(f"Resolved: {resolved}")
             if not resolved:
-                # Try to handle services failing to load
-                #resolved = self._resolve_characteristics(await client.get_services())
-                LOGGER.debug(f"Chars were not resolved.  Trying again...")
+                LOGGER.debug("%s: Retry resolving services", self.name)
                 resolved = self._resolve_characteristics(client.services)
-                LOGGER.debug(f"After trying to resolve: Resolved: {resolved}")
             self._cached_services = client.services if resolved else None
-
             self._client = client
             await self._retrieve_device_info()
             self._reset_disconnect_timer()
@@ -372,10 +376,10 @@ class HILIGHTINGInstance:
             return
         LOGGER.warning("%s: Device unexpectedly disconnected", self.name)
 
-    def _disconnect(self) -> None:
+    async def _disconnect(self) -> None:
         """Disconnect from device."""
         self._disconnect_timer = None
-        asyncio.create_task(self._execute_timed_disconnect())
+        await self._execute_timed_disconnect()
 
     async def stop(self) -> None:
         """Stop the LEDBLE."""
